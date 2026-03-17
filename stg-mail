@@ -1,0 +1,315 @@
+#!/bin/bash
+
+do_help() {
+cat <<EOF
+stg-mail: "old school" 'stg mail' on top of modern 'stg email'
+
+The 'stg email' command is mostly just a thin wrapper around 'git
+format-patch' and 'git send-email'. That means it loses familiar
+workflows like:
+
+stg mail -e -a -m #start a patch cover letter from the series
+stg mail -c \$cover --auto #use previous cover and send with all patch
+			    tags added to the cover letter Cc: line
+This command adds a "-d|--desc" option that did not exist in stg-mail
+and serves to bridge the old 'stg mail' world with 'stg email' that
+wants to stage patches in a directory before sending them out.
+
+So, '--desc \$desc' becomes both the directory name for the patches and
+appended to a file named 'cover-\$desc' where the cover letter is
+prepared.
+
+The first paragraph of the cover-letter file becomes the cover-letter
+Subject: and the rest becomes the body.
+
+The generated cover-letter in \$desc/0000-cover-letter.patch will
+format the contents and add the shortlog, diffstat, and base-commit.
+
+Any arguments outside of the ones stg-mail explicitly handles are
+passed through to 'stg email format' except for '--to and --cc', those
+are passed through to 'stg email send'.
+
+For automatic Cc: handling there are 2 modes, --auto and --auto-all. The
+--auto-all option copies anyone listed in any patch trailer on all
+patches. The --auto option only copies people listed in each patch
+directly. In both cases the cover-letter always includes all trailers.
+The default is no automatic Cc every recepient must be specified
+explicitly with --to and --cc.
+
+Patch series workflow:
+
+1) start a cover-letter (named cover-\$desc) for a series:
+
+   stg-mail -a -e -d \$desc --to=\$to --cc=\$cc --auto -m
+
+2) review the resulting patches including trailers, finalize the
+   cover-letter, then:
+
+   stg-mail -a -c -d \$desc --to=\$to --cc=\$cc --auto
+
+For a single patch without a cover-letter but with version commentary
+below the --- line.
+
+1) format the single patch
+
+   stg-mail -d \$desc \$(stg top) --to=\$to --cc=\$cc --auto -m
+
+2) edit the version commentary, then send the patch without further
+   formatting.
+
+   stg-mail -d \$desc \$(stg top) --to=\$to --cc=\$cc --auto --no-format
+
+Note that --no-format can result in options being ignored relative to
+the dry-run invocation. For example, "--in-reply-to" is now an option
+that stg-mail is careful to always forward to "stg email send" just in
+case the dry-run format did not have it.
+
+The rule is avoid adding new options that affect the patch content
+from the dry-run step to the "--no-format" send step, or update the
+script to explicitly add those.
+EOF
+}
+
+# use stg series to check if we are in a git repository
+stg series -c >/dev/null || { echo "no patch series found, exiting"; exit 1; }
+
+AUTO_FLAG=""
+PASSTHRU_ARGS=()
+FORMAT_ARGS=()
+SEND_ARGS=()
+all_cc=()
+cc_args=()
+desc=""
+edit="no"
+cover="no"
+dry_run=""
+description_file=()
+format="yes"
+auto="no"
+auto_all="no"
+count=$(stg series --count)
+base=$(stg id $(stg series --noprefix -r | tail -n 1)^)
+top=$(stg id $(stg top))
+self=$(git config --get user.email)
+suppress_self="yes"
+version=""
+prefix=""
+reset="no"
+
+git_trailers() {
+	if [ $suppress_self = "yes" ]; then
+		git log --format='%(trailers:valueonly=1)' $@ | grep -v $self | grep -E "<.+@.+>" | sort -u
+	else
+		git log --format='%(trailers:valueonly=1)' $@ | grep -E "<.+@.+>" | sort -u
+	fi
+}
+
+format_auto() {
+	for i in $desc/*.patch; do
+		in_cc=()
+		if [[ $i =~ 0000-cover-letter.patch$ ]]; then
+			mapfile -t in_cc < <(git_trailers $base..)
+		else
+			continue
+			#patch_num=$(echo $i | grep -E -o "[0-9]+++")
+			#patch_rev=$((count - patch_num + 1))
+			#mapfile -t in_cc < <(git_trailers $top~$patch_rev..$top~$((patch_rev - 1)))
+		fi
+		sed -i "/^Cc:/d" $i
+		cc_list="Cc: "
+		for j in "${in_cc[@]}"; do
+		cc_list+="$j, "
+		done
+		cc_list=${cc_list%, }
+		sed -i "/^Subject:/{:a;n;/^$/ {i\
+		$cc_list
+		b};ba}" $i
+	done
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --auto-all)
+	    if [ $auto = "yes" ]; then
+		echo "$0: --auto and --auto-all are mutually exclusive"
+		exit 1
+	    fi
+	    auto_all="yes"
+	    mapfile -t all_cc < <(git_trailers $base..)
+	    for i in "${all_cc[@]}"; do
+		cc_args+=("--cc" "$i")
+	    done
+	    SEND_ARGS+=("-G")
+	    SEND_ARGS+=("--suppress-cc=all")
+            shift
+            ;;
+	--auto)
+	    if [ $auto_all = "yes" ]; then
+		echo "$0: --auto and --auto-all are mutually exclusive"
+		exit 1
+	    fi
+	    auto="yes"
+	    SEND_ARGS+=("-G")
+	    SEND_ARGS+=("--suppress-cc=self")
+	    shift
+	    ;;
+	"--desc="*)
+	    desc=$(echo $1 | awk -F"=" '{ print $2 }')
+	    shift
+	    ;;
+	-d|--desc)
+	    desc="$2"
+	    shift
+	    shift
+	    ;;
+	--base)
+	    base="$2"
+	    shift
+	    shift
+	    ;;
+	-e|--edit-cover)
+	    edit="yes"
+	    cover="yes"
+	    shift
+            ;;
+	"--in-reply-to="*)
+            SEND_ARGS+=("$1")
+	    shift
+	    ;;
+	--in-reply-to)
+            SEND_ARGS+=("$1")
+            SEND_ARGS+=("$2")
+	    shift
+	    shift
+	    ;;
+        -c|--cover)
+	    cover="yes"
+            shift
+	    ;;
+	-h|--help)
+	    do_help
+	    exit 1
+	    shift
+	    ;;
+	-m)
+	    dry_run="--dry-run"
+	    shift
+	    ;;
+	--no-format)
+	    format="no"
+	    shift
+	    ;;
+	"--to="*|"--cc="*)
+            SEND_ARGS+=("$1")
+	    shift
+	    ;;
+	--to|--cc)
+            SEND_ARGS+=("$1")
+            SEND_ARGS+=("$2")
+	    shift
+	    shift
+	    ;;
+	"--prefix="*)
+	    prefix=${1#--prefix=}
+	    shift
+	    ;;
+	--prefix)
+	    prefix=$2
+	    shift
+	    shift
+	    ;;
+	--reset)
+	    reset="yes"
+	    shift
+	    ;;
+	-v)
+	    version="$2"
+	    PASSTHRU_ARGS+=("$1")
+	    PASSTHRU_ARGS+=("$2")
+	    shift
+	    shift
+	    ;;
+        *)
+            # Pass all other options through
+            PASSTHRU_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ ! $desc ]]; then
+	echo "$0: missing set desc (-d|--desc)"
+	exit 1
+fi
+
+base_desc=$desc
+if [[ $version ]]; then
+	desc=$desc-v$version
+fi
+
+if [ $reset = "yes" ]; then
+	echo "remove cover-$desc and patches?"
+	rm -I cover-$desc $desc/*
+fi
+
+cover_template() {
+	echo "# <REPLACE>cover letter subject: $desc</REPLACE>" >> cover-$desc
+	echo -e "# \n# <REPLACE>cover letter body:" >> cover-$desc
+	echo -e "# \n# NOTE: $desc/0000-cover-letter.patch will add diffstat and base-commit to this template" >> cover-$desc
+	echo "# " >> cover-$desc
+	git shortlog $base.. | awk '{ print "# " $0 }' >> cover-$desc
+	git diff --stat -M $base.. | awk '{ print "# " $0 }' >> cover-$desc
+	echo -e "# </REPLACE>" >> cover-$desc
+}
+
+if [ $edit = "yes" ]; then
+	did_cover_template=0
+	if [ ! -e cover-$desc ]; then
+		if [[ $version ]]; then
+			if [[ $version -eq 2 ]]; then
+				cover_prev="cover-$base_desc"
+			else
+				cover_prev="cover-$base_desc-v$((version - 1))"
+			fi
+
+			if [ -e $cover_prev ]; then
+				cp $cover_prev cover-$desc
+			else
+				cover_template
+				did_cover_template=1
+			fi
+		else
+			cover_template
+			did_cover_template=1
+		fi
+	fi
+
+	vim cover-$desc
+	# if cover_template was executed above, remove comment lines
+	[[ did_cover_template -eq 1 ]] && sed -i '/^# /d' cover-$desc
+fi
+
+if [ $cover = "yes" ]; then
+	description_file="-G --cover-letter -G --cover-from-description=subject -G --description-file=cover-$desc"
+fi
+
+if [ $auto = "no" -a $auto_all = "no" ]; then
+	SEND_ARGS+=("-G")
+	SEND_ARGS+=("--suppress-cc=all")
+fi
+
+if [[ $prefix ]]; then
+	FORMAT_ARGS+=("--subject-prefix")
+	FORMAT_ARGS+=("$prefix PATCH")
+fi
+
+if [ $format = "yes" ]; then
+	[ -e $base_desc ] && rm $base_desc/*.patch
+	stg email format -o $base_desc $description_file --base $base "${FORMAT_ARGS[@]}" "${PASSTHRU_ARGS[@]}"
+	if [ $auto = "yes" ]; then
+		format_auto
+	fi
+fi
+
+stg email send $dry_run ./$base_desc "${cc_args[@]}" "${SEND_ARGS[@]}" -G --thread -G --no-chain-reply-to
